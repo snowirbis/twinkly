@@ -5,11 +5,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	Version = "0.0.4"
 )
 
 type Gestalt struct {
@@ -79,19 +84,88 @@ type MovieResponse struct {
 	Code            int     `json:"code"`
 }
 
+type PingResponse struct {
+	URL      string `json:"url"`
+	Reply    bool   `json:"reply"`
+	AuthOK   bool   `json:"auth_ok"`
+	TokenSet bool   `json:"token_set"`
+	HTTPCode int    `json:"http_code,omitempty"`
+	ErrStage string `json:"err_stage,omitempty"`
+	Err      string `json:"err,omitempty"`
+}
+
 type TwinklyManager struct {
-	mu     sync.Mutex
+	reqMu sync.Mutex
+	tokMu sync.Mutex
+
 	apiUrl string
 	token  string
-	ticker *time.Ticker
+
+	ticker      *time.Ticker
+	refreshStop chan struct{}
+
+	httpClient *http.Client
+}
+
+func (tm *TwinklyManager) GetVersion() string {
+	return Version
 }
 
 func New(url string) *TwinklyManager {
 	tm := &TwinklyManager{
-		apiUrl: url,
+		apiUrl: strings.TrimRight(url, "/"),
+		httpClient: &http.Client{
+			Timeout: 5 * time.Second,
+		},
 	}
-	tm.Authenticate()
+	_ = tm.Authenticate()
 	return tm
+}
+
+func (tm *TwinklyManager) Ping() (*PingResponse, error) {
+	res := &PingResponse{
+		URL: tm.apiUrl,
+	}
+
+	// 1) lightweight reply check: gestalt without token (some firmwares may still require token,
+	// but if it responds with 401/404 we still know device is reachable)
+	req, err := http.NewRequest("GET", tm.apiUrl+"/xled/v1/gestalt", nil)
+	if err != nil {
+		res.ErrStage = "new_request"
+		res.Err = err.Error()
+		return res, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := tm.httpClient.Do(req)
+	if err != nil {
+		res.ErrStage = "http_do"
+		res.Err = err.Error()
+		return res, err
+	}
+	res.HTTPCode = resp.StatusCode
+	_ = resp.Body.Close()
+	res.Reply = true
+
+	// 2) auth check
+	if err := tm.Authenticate(); err != nil {
+		res.ErrStage = "authenticate"
+		res.Err = err.Error()
+		// Reply already true, but auth failed
+		return res, err
+	}
+
+	tok, err := tm.GetToken()
+	if err != nil {
+		res.ErrStage = "get_token"
+		res.Err = err.Error()
+		return res, err
+	}
+
+	res.TokenSet = tok != ""
+	res.AuthOK = res.TokenSet
+
+	return res, nil
 }
 
 func (tm *TwinklyManager) Authenticate() error {
@@ -112,35 +186,60 @@ func (tm *TwinklyManager) Authenticate() error {
 }
 
 func (tm *TwinklyManager) SetToken(token string) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
+	tm.tokMu.Lock()
 	tm.token = token
+	tm.tokMu.Unlock()
 }
 
 func (tm *TwinklyManager) GetToken() (string, error) {
+	tm.tokMu.Lock()
+	tok := tm.token
+	tm.tokMu.Unlock()
 
-	if tm.token == "" {
+	if tok == "" {
 		if err := tm.Authenticate(); err != nil {
 			return "", err
 		}
+		tm.tokMu.Lock()
+		tok = tm.token
+		tm.tokMu.Unlock()
 	}
 
-	return tm.token, nil
+	return tok, nil
 }
 
 func (tm *TwinklyManager) startTokenRefresh() {
+	tm.tokMu.Lock()
+
+	// stop previous goroutine + ticker
+	if tm.refreshStop != nil {
+		close(tm.refreshStop)
+		tm.refreshStop = nil
+	}
 	if tm.ticker != nil {
-		tm.ticker.Stop() // Зупиняємо попередній тікер, якщо він існує
+		tm.ticker.Stop()
+		tm.ticker = nil
 	}
 
+	// start new
+	tm.refreshStop = make(chan struct{})
 	tm.ticker = time.NewTicker(14000 * time.Second)
 
-	go func() {
-		for range tm.ticker.C {
-			_ = tm.Authenticate() // Оновлення токена
+	stop := tm.refreshStop
+	t := tm.ticker
+
+	tm.tokMu.Unlock()
+
+	go func(t *time.Ticker, stop <-chan struct{}) {
+		for {
+			select {
+			case <-t.C:
+				_ = tm.Authenticate()
+			case <-stop:
+				return
+			}
 		}
-	}()
+	}(t, stop)
 }
 
 func (tm *TwinklyManager) GetInfo() (Gestalt, error) {
@@ -260,7 +359,11 @@ func (tm *TwinklyManager) TWsetColor(color Color, token string) error {
 
 func (tm *TwinklyManager) TWgetColor(token string) (Color, error) {
 
-	body, _ := tm.TWrequest("GET", "/xled/v1/led/color", "", token)
+	body, err := tm.TWrequest("GET", "/xled/v1/led/color", "", token)
+
+	if err != nil {
+		return Color{}, err
+	}
 
 	var resp Color
 
@@ -321,42 +424,83 @@ func (tm *TwinklyManager) TWsetMovie(id int, token string) error {
 }
 
 func (tm *TwinklyManager) TWgetMovies(token string) (MovieResponse, error) {
-	data, _ := tm.TWrequest("GET", "/xled/v1/movies", "", token)
+
+	data, err := tm.TWrequest("GET", "/xled/v1/movies", "", token)
+
+	if err != nil {
+		return MovieResponse{}, err
+	}
 
 	var movies MovieResponse
-	json.Unmarshal([]byte(data), &movies)
+
+	if err := json.Unmarshal(data, &movies); err != nil {
+		return MovieResponse{}, err
+	}
 
 	return movies, nil
 }
 
-func (tm *TwinklyManager) TWrequest(method, endpoint string, data interface{}, token ...string) ([]byte, error) {
-	jsonData, _ := json.Marshal(data)
-	contentLength := len(jsonData)
+func (tm *TwinklyManager) TWrequest(method, endpoint string, data any, token ...string) ([]byte, error) {
 
-	req, err := http.NewRequest(method, tm.apiUrl+endpoint, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("TWrequest.NewRequest error - %w", err)
+	tm.reqMu.Lock()
+	defer tm.reqMu.Unlock()
+
+	var bodyReader io.Reader
+
+	if data != nil {
+		jsonData, err := json.Marshal(data)
+		if err != nil {
+			return nil, fmt.Errorf("TWrequest.marshal error: %w", err)
+		}
+		bodyReader = bytes.NewReader(jsonData)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Content-Length", fmt.Sprintf("%d", contentLength))
-	if len(token) > 0 {
+	req, err := http.NewRequest(method, tm.apiUrl+endpoint, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("TWrequest.NewRequest error: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+	if data != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	if len(token) > 0 && token[0] != "" {
 		req.Header.Set("X-Auth-Token", token[0])
 	}
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := tm.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("TWrequest.client.Do error - %w", err)
+		return nil, fmt.Errorf("TWrequest.Do error: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("TWrequest.ioutil.ReadAll error - %w", err)
+		return nil, fmt.Errorf("TWrequest.ReadAll error: %w", err)
 	}
 
-	return body, nil
+	trim := bytes.TrimSpace(raw)
+
+	// HTTP non-2xx -> return readable error
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		cut := trim
+		if len(cut) > 200 {
+			cut = cut[:200]
+		}
+		return nil, fmt.Errorf("twinkly http %d %s: %q", resp.StatusCode, resp.Status, string(cut))
+	}
+
+	// Twinkly returns plain-text instead of JSON if error occurs
+	if len(trim) > 0 && trim[0] != '{' && trim[0] != '[' {
+		cut := trim
+		if len(cut) > 200 {
+			cut = cut[:200]
+		}
+		return nil, fmt.Errorf("twinkly non-json response (ct=%q): %q", resp.Header.Get("Content-Type"), string(cut))
+	}
+
+	return raw, nil
 }
 
 func (tm *TwinklyManager) generateChallenge(length int) string {
